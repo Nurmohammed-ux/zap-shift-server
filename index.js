@@ -7,6 +7,19 @@ const app = express();
 // stripe
 const stripe = require("stripe")(process.env.STRIPE_SECRET);
 const crypto = require("crypto");
+const { initializeApp, cert } = require("firebase-admin/app");
+const { getAuth } = require("firebase-admin/auth");
+
+try {
+  const serviceAccount = require("./zap-shift-firebase-adminsdk.json");
+
+  initializeApp({
+    credential: cert(serviceAccount),
+  });
+  console.log("Firebase initialized");
+} catch (err) {
+  console.error(err);
+}
 
 function generateTrackingId() {
   const prefix = "TRK";
@@ -20,6 +33,31 @@ function generateTrackingId() {
 app.use(cors());
 app.use(express.json());
 
+//Jwt middleware
+const verifyFirebaseToken = async (req, res, next) => {
+  try {
+    const authorization = req.headers.authorization;
+
+    if (!authorization || !authorization.startsWith("Bearer ")) {
+      return res
+        .status(401)
+        .send({ message: "Unauthorized Access: No token provided" });
+    }
+
+    const token = authorization.split(" ")[1];
+
+    const decoded = await getAuth().verifyIdToken(token);
+    req.token_email = decoded.email;
+    next();
+  } catch (err) {
+    console.error("Token verification error:", err.message);
+    return res.status(401).send({
+      message: "Invalid token",
+      error: err.message,
+    });
+  }
+};
+
 // mongodb
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.jd5uu0i.mongodb.net/?appName=Cluster0`;
 // Create a MongoClient with a MongoClientOptions object to set the Stable API version
@@ -32,8 +70,10 @@ const client = new MongoClient(uri, {
 });
 
 const database = client.db("zap_shift_db");
+const userCollections = database.collection("users");
 const parcelCollections = database.collection("parcels");
 const paymentCollections = database.collection("payments");
+const riderCollections = database.collection("riders");
 
 client
   .connect()
@@ -55,6 +95,27 @@ app.get("/health", (req, res) => {
   });
 });
 
+// users related api
+app.post("/users", async (req, res) => {
+  try {
+    const user = req.body;
+    user.role = "user";
+    user.createdAt = new Date();
+    const email = user.email;
+    const existingUser = await userCollections.findOne({ email });
+
+    if (existingUser) {
+      return res.send({ message: "User already exists" });
+    }
+
+    const result = await userCollections.insertOne(user);
+    res.send(user);
+  } catch (error) {
+    res.status(500).send({ message: error.message });
+  }
+});
+
+// Parcels Api
 app.get("/parcels", async (req, res) => {
   try {
     const query = {};
@@ -99,7 +160,7 @@ app.post("/parcels", async (req, res) => {
   }
 });
 
-// Payment Api
+// Payment and session related Api
 app.post("/payment-checkout-session", async (req, res) => {
   try {
     const paymentInfo = req.body;
@@ -170,7 +231,6 @@ app.post("/create-checkout-session", async (req, res) => {
   }
 });
 
-
 app.patch("/payment-success", async (req, res) => {
   try {
     const sessionId = req.query.session_id;
@@ -232,7 +292,7 @@ app.patch("/payment-success", async (req, res) => {
           : "Payment processed successfully",
         modifyParcel: result,
         trackingId: trackingId,
-        transactionId: session.payment_intent,  
+        transactionId: session.payment_intent,
         paymentInfo: resultPayment,
       });
     }
@@ -250,6 +310,147 @@ app.delete("/parcels/:id", async (req, res) => {
     const query = { _id: new ObjectId(id) };
 
     const result = await parcelCollections.deleteOne(query);
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: error.message });
+  }
+});
+
+app.get("/payments", verifyFirebaseToken, async (req, res) => {
+  try {
+    const email = req.query.email;
+
+    if (email !== req.token_email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    const result = await paymentCollections
+      .aggregate([
+        {
+          $match: {
+            customerEmail: email,
+          },
+        },
+        {
+          $addFields: {
+            parcelObjectId: {
+              $toObjectId: "$parcelId",
+            },
+          },
+        },
+        {
+          $lookup: {
+            from: "parcels",
+            localField: "parcelObjectId",
+            foreignField: "_id",
+            as: "parcel",
+          },
+        },
+        {
+          $unwind: "$parcel",
+        },
+        {
+          $sort: { paidAt: -1 },
+        },
+      ])
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: error.message });
+  }
+});
+
+// Riders related apis
+
+app.get("/riders", async (req, res) => {
+  try {
+    const query = {};
+    if (req.query.status) {
+      query.status = req.query.status;
+    }
+    const cursor = riderCollections.find(query);
+    const result = await cursor.toArray();
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: error.message });
+  }
+});
+
+app.post("/riders", async (req, res) => {
+  try {
+    const rider = req.body;
+
+    const existingRider = await riderCollections.findOne({
+      email: rider.email,
+    });
+
+    if (existingRider) {
+      return res.status(409).send({
+        message: "Rider application already exists for this email.",
+        insertedId: null,
+      });
+    }
+
+    // 2. If not, proceed with insertion
+    rider.status = "pending";
+    rider.createdAt = new Date();
+
+    const result = await riderCollections.insertOne(rider);
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: error.message });
+  }
+});
+
+app.patch("/riders/:id", verifyFirebaseToken, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const status = req.body.status;
+    const email = req.body.email;
+
+    if (email !== req.token_email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    const query = { _id: new ObjectId(id) };
+    const updateDoc = {
+      $set: {
+        status: status,
+      },
+    };
+    const result = await riderCollections.updateOne(query, updateDoc);
+
+    if (status === "approved") {
+      const userQuery = { email };
+      const updateUser = {
+        $set: {
+          role: "rider",
+        },
+      };
+      const updateResult = await userCollections.updateOne(
+        userQuery,
+        updateUser,
+      );
+    }
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: error.message });
+  }
+});
+
+app.delete("/riders/:id", verifyFirebaseToken, async (req, res) => {
+  try {
+    const id = req.params.id;
+    const email = req.query.email;
+
+    if (email !== req.token_email) {
+      return res.status(403).send({ message: "Forbidden access" });
+    }
+
+    const query = { _id: new ObjectId(id) };
+    const result = await riderCollections.deleteOne(query);
     res.send(result);
   } catch (error) {
     console.error(error);
