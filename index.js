@@ -95,6 +95,20 @@ app.get("/health", (req, res) => {
   });
 });
 
+//middleware with data access for admin and verify that
+//  must be used after verifyFirebaseToken
+const verifyAdmin = async (req, res, next) => {
+  const email = req.token_email;
+  const query = { email };
+  const user = await userCollections.findOne(query);
+
+  if (!user || user.role !== "admin") {
+    return res.status(403).send({ message: "Forbidden Access" });
+  }
+
+  next();
+};
+
 // users related api
 app.post("/users", async (req, res) => {
   try {
@@ -114,6 +128,58 @@ app.post("/users", async (req, res) => {
     res.status(500).send({ message: error.message });
   }
 });
+
+app.get("/users", verifyFirebaseToken, async (req, res) => {
+  try {
+    const cursor = userCollections.find().sort({ createdAt: -1 });
+    const result = await cursor.toArray();
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: error.message });
+  }
+});
+
+app.get("users/:id", async (req, res) => {});
+
+app.get("/users/:email/role", async (req, res) => {
+  try {
+    const email = req.params.email;
+    const query = { email };
+    const user = await userCollections.findOne(query);
+    res.send({ role: user?.role || "user" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: error.message });
+  }
+});
+
+app.patch(
+  "/users/:id/role",
+  verifyFirebaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      const roleInfo = req.body;
+      const query = { _id: new ObjectId(id) };
+
+      const updateDoc = {
+        $set: {
+          ...roleInfo,
+        },
+      };
+      const result = await userCollections.updateOne(query, updateDoc);
+
+      res.send(result);
+    } catch (error) {
+      console.error(error);
+      res.status(500).send({
+        message: error.message,
+      });
+    }
+  },
+);
 
 // Parcels Api
 app.get("/parcels", async (req, res) => {
