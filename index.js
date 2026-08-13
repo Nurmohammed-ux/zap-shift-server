@@ -129,14 +129,49 @@ app.post("/users", async (req, res) => {
   }
 });
 
-app.get("/users", verifyFirebaseToken, async (req, res) => {
+app.get("/users", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
-    const cursor = userCollections.find().sort({ createdAt: -1 });
-    const result = await cursor.toArray();
+    const searchText = req.query.searchText;
+
+    if (searchText && typeof searchText !== "string") {
+      return res.status(400).send({
+        message: "Invalid search text",
+      });
+    }
+
+    const query = {};
+
+    if (searchText) {
+      const safeSearchText = searchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+      query.$or = [
+        {
+          displayName: {
+            $regex: safeSearchText,
+            $options: "i",
+          },
+        },
+        {
+          email: {
+            $regex: safeSearchText,
+            $options: "i",
+          },
+        },
+      ];
+    }
+
+    const result = await userCollections
+      .find(query)
+      .sort({ createdAt: -1 })
+      .limit(7)
+      .toArray();
+
     res.send(result);
   } catch (error) {
     console.error(error);
-    res.status(500).send({ message: error.message });
+    res.status(500).send({
+      message: error.message,
+    });
   }
 });
 
@@ -182,21 +217,68 @@ app.patch(
 );
 
 // Parcels Api
+// for my-parcels and assigned rider
 app.get("/parcels", async (req, res) => {
   try {
     const query = {};
-    const { email } = req.query;
+    const { email, deliveryStatus } = req.query;
+
     if (email) {
       query.senderEmail = email;
     }
 
-    const options = { sort: { createdAt: -1 } };
-    const cursor = parcelCollections.find(query, options);
-    const result = await cursor.toArray();
+    if (deliveryStatus) {
+      const statuses = deliveryStatus.split(",");
+      query.deliveryStatus = {
+        $in: statuses,
+      };
+    }
+
+    const result = await parcelCollections
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
     res.send(result);
   } catch (error) {
     console.error(error);
-    res.status(500).send({ message: error.message });
+    res.status(500).send({
+      message: error.message,
+    });
+  }
+});
+
+// get for assigned deliveries
+app.get("/parcels/rider", async (req, res) => {
+  try {
+    const { riderEmail, deliveryStatus } = req.query;
+
+    if (!riderEmail) {
+      return res.status(400).send({ message: "riderEmail is required" });
+    }
+
+    const query = {
+      riderEmail: riderEmail, // Only match parcels explicitly assigned to this rider
+    };
+
+    if (deliveryStatus) {
+      const statuses = deliveryStatus.split(",");
+      query.deliveryStatus = {
+        $in: statuses,
+      };
+    }
+
+    const result = await parcelCollections
+      .find(query)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({
+      message: error.message,
+    });
   }
 });
 
@@ -219,6 +301,102 @@ app.post("/parcels", async (req, res) => {
     parcel.createdAt = new Date();
 
     const result = await parcelCollections.insertOne(parcel);
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: error.message });
+  }
+});
+
+// TODO: rename this to be specific like /parcels/:id/assign from assignedRider
+app.patch("/parcels/:id", async (req, res) => {
+  try {
+    const { riderId, riderName, riderContact, riderEmail } = req.body;
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+
+    const updateDoc = {
+      $set: {
+        deliveryStatus: "driver_assigned",
+        riderId: riderId,
+        riderName: riderName,
+        riderEmail: riderEmail,
+        riderContact: riderContact,
+      },
+    };
+
+    const result = await parcelCollections.updateOne(query, updateDoc);
+
+    // update rider work status
+    const riderQuery = { _id: new ObjectId(riderId) };
+    const updatedRiderDoc = {
+      $set: {
+        workStatus: "in-transit",
+      },
+    };
+
+    const riderResult = await riderCollections.updateOne(
+      riderQuery,
+      updatedRiderDoc,
+    );
+
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: error.message });
+  }
+});
+
+// from assignedDeliveries
+app.patch("/parcels/:id/status", async (req, res) => {
+  try {
+    const { deliveryStatus, riderEmail } = req.body;
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+
+    let updateDoc = {
+      $set: {
+        deliveryStatus: deliveryStatus,
+      },
+    };
+
+    // If a rider is rejecting the parcel, mark it as driver_rejected, clear assignment, and blacklist the rider
+    if (deliveryStatus === "driver_rejected" && riderEmail) {
+      updateDoc = {
+        $set: {
+          deliveryStatus: "driver_rejected",
+          riderId: null,
+          riderName: null,
+          riderEmail: null,
+          riderContact: null,
+        },
+        $push: { rejectedRiders: riderEmail },
+      };
+    }
+
+    const result = await parcelCollections.updateOne(query, updateDoc);
+
+    // If the parcel is successfully marked as delivered, update the rider's workStatus to available
+    if (deliveryStatus === "parcel-delivered" && riderEmail) {
+      await riderCollections.updateOne(
+        { email: riderEmail },
+        { $set: { workStatus: "available" } },
+      );
+    }
+
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: error.message });
+  }
+});
+
+app.delete("/parcels/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const query = { _id: new ObjectId(id) };
+
+    const result = await parcelCollections.deleteOne(query);
     res.send(result);
   } catch (error) {
     console.error(error);
@@ -322,7 +500,7 @@ app.patch("/payment-success", async (req, res) => {
         const update = {
           $set: {
             paymentStatus: "paid",
-            deliveryStatus: "Ready for Pickup",
+            deliveryStatus: "ready-for-pickup",
             transactionId: session.payment_intent,
             trackingId: trackingId,
             paidAt: new Date(),
@@ -370,22 +548,9 @@ app.patch("/payment-success", async (req, res) => {
   }
 });
 
-app.delete("/parcels/:id", async (req, res) => {
-  try {
-    const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
-
-    const result = await parcelCollections.deleteOne(query);
-    res.send(result);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: error.message });
-  }
-});
-
 app.get("/payments", verifyFirebaseToken, async (req, res) => {
   try {
-    const email = req.query.email;
+    const email = req.token_email;
 
     if (email !== req.token_email) {
       return res.status(403).send({ message: "Forbidden access" });
@@ -432,10 +597,19 @@ app.get("/payments", verifyFirebaseToken, async (req, res) => {
 
 app.get("/riders", async (req, res) => {
   try {
+    const { status, district, workStatus } = req.query;
     const query = {};
-    if (req.query.status) {
-      query.status = req.query.status;
+
+    if (status) {
+      query.status = status;
     }
+    if (district) {
+      query.district = district;
+    }
+    if (workStatus) {
+      query.workStatus = workStatus;
+    }
+
     const cursor = riderCollections.find(query);
     const result = await cursor.toArray();
     res.send(result);
@@ -470,59 +644,113 @@ app.post("/riders", async (req, res) => {
   }
 });
 
-app.patch("/riders/:id", verifyFirebaseToken, async (req, res) => {
+// app.patch("/riders/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
+//   try {
+//     const id = req.params.id;
+//     const status = req.body.status;
+//     const email = req.body.email;
+
+//     if (email !== req.token_email) {
+//       return res.status(403).send({ message: "Forbidden access" });
+//     }
+
+//     const query = { _id: new ObjectId(id) };
+//     const updateDoc = {
+//       $set: {
+//         status: status,
+//         workStatus: "available",
+//       },
+//     };
+//     const result = await riderCollections.updateOne(query, updateDoc);
+
+//     if (status === "approved") {
+//       const userQuery = { email };
+//       const updateUser = {
+//         $set: {
+//           role: "rider",
+//         },
+//       };
+//       const updateResult = await userCollections.updateOne(
+//         userQuery,
+//         updateUser,
+//       );
+//     }
+//     res.send(result);
+//   } catch (error) {
+//     res.status(500).send({ message: error.message });
+//   }
+// });
+
+app.patch("/riders/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
     const id = req.params.id;
-    const status = req.body.status;
-    const email = req.body.email;
+    const { status } = req.body;
 
-    if (email !== req.token_email) {
-      return res.status(403).send({ message: "Forbidden access" });
+    const rider = await riderCollections.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!rider) {
+      return res.status(404).send({
+        message: "Rider not found",
+      });
     }
 
-    const query = { _id: new ObjectId(id) };
     const updateDoc = {
       $set: {
-        status: status,
+        status,
       },
     };
-    const result = await riderCollections.updateOne(query, updateDoc);
 
     if (status === "approved") {
-      const userQuery = { email };
-      const updateUser = {
-        $set: {
-          role: "rider",
+      updateDoc.$set.workStatus = "available";
+
+      await userCollections.updateOne(
+        { email: rider.email },
+        {
+          $set: {
+            role: "rider",
+          },
         },
-      };
-      const updateResult = await userCollections.updateOne(
-        userQuery,
-        updateUser,
       );
     }
-    res.send(result);
-  } catch (error) {
-    res.status(500).send({ message: error.message });
-  }
-});
 
-app.delete("/riders/:id", verifyFirebaseToken, async (req, res) => {
-  try {
-    const id = req.params.id;
-    const email = req.query.email;
+    const result = await riderCollections.updateOne(
+      { _id: new ObjectId(id) },
+      updateDoc,
+    );
 
-    if (email !== req.token_email) {
-      return res.status(403).send({ message: "Forbidden access" });
-    }
-
-    const query = { _id: new ObjectId(id) };
-    const result = await riderCollections.deleteOne(query);
     res.send(result);
   } catch (error) {
     console.error(error);
-    res.status(500).send({ message: error.message });
+    res.status(500).send({
+      message: error.message,
+    });
   }
 });
+
+app.delete(
+  "/riders/:id",
+  verifyFirebaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const id = req.params.id;
+      const email = req.query.email;
+
+      if (email !== req.token_email) {
+        return res.status(403).send({ message: "Forbidden access" });
+      }
+
+      const query = { _id: new ObjectId(id) };
+      const result = await riderCollections.deleteOne(query);
+      res.send(result);
+    } catch (error) {
+      console.error(error);
+      res.status(500).send({ message: error.message });
+    }
+  },
+);
 
 app.listen(port, () => {
   console.log(`ZapShift app listening on port ${port}`);
