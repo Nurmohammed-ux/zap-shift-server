@@ -74,6 +74,7 @@ const userCollections = database.collection("users");
 const parcelCollections = database.collection("parcels");
 const paymentCollections = database.collection("payments");
 const riderCollections = database.collection("riders");
+const trackingCollections = database.collection("trackings");
 
 client
   .connect()
@@ -107,6 +108,17 @@ const verifyAdmin = async (req, res, next) => {
   }
 
   next();
+};
+
+const logTracking = async (trackingId, status) => {
+  const log = {
+    trackingId,
+    status,
+    details: status.split("-").join(" "),
+    createdAt: new Date(),
+  };
+  const result = await trackingCollections.insertOne(log);
+  return result;
 };
 
 // users related api
@@ -248,7 +260,7 @@ app.get("/parcels", async (req, res) => {
   }
 });
 
-// get for assigned deliveries
+// get for assigned deliveries and completed deliveries
 app.get("/parcels/rider", async (req, res) => {
   try {
     const { riderEmail, deliveryStatus } = req.query;
@@ -295,10 +307,17 @@ app.get("/parcels/:id", async (req, res) => {
   }
 });
 
+// from pricing, logTracking, created trackingId
 app.post("/parcels", async (req, res) => {
   try {
     const parcel = req.body;
+    const trackingId = generateTrackingId();
+
     parcel.createdAt = new Date();
+    parcel.trackingId = trackingId;
+
+    // 🌟 3. INSERT LOG TRACKING HERE
+    await logTracking(trackingId, "parcel-create");
 
     const result = await parcelCollections.insertOne(parcel);
     res.send(result);
@@ -308,16 +327,17 @@ app.post("/parcels", async (req, res) => {
   }
 });
 
-// TODO: rename this to be specific like /parcels/:id/assign from assignedRider
+// TODO: rename this to be specific like /parcels/:id/assign from assignedRider, logTracking
 app.patch("/parcels/:id", async (req, res) => {
   try {
-    const { riderId, riderName, riderContact, riderEmail } = req.body;
+    const { riderId, riderName, riderContact, riderEmail, trackingId } =
+      req.body;
     const id = req.params.id;
     const query = { _id: new ObjectId(id) };
 
     const updateDoc = {
       $set: {
-        deliveryStatus: "driver_assigned",
+        deliveryStatus: "driver-assigned",
         riderId: riderId,
         riderName: riderName,
         riderEmail: riderEmail,
@@ -340,6 +360,9 @@ app.patch("/parcels/:id", async (req, res) => {
       updatedRiderDoc,
     );
 
+    // 🌟 3. INSERT LOG TRACKING HERE
+    await logTracking(trackingId, "driver-assigned");
+
     res.send(result);
   } catch (error) {
     console.error(error);
@@ -347,10 +370,10 @@ app.patch("/parcels/:id", async (req, res) => {
   }
 });
 
-// from assignedDeliveries
+// from assignedDeliveries, logTracking
 app.patch("/parcels/:id/status", async (req, res) => {
   try {
-    const { deliveryStatus, riderEmail } = req.body;
+    const { deliveryStatus, riderEmail, trackingId } = req.body;
     const id = req.params.id;
     const query = { _id: new ObjectId(id) };
 
@@ -361,10 +384,10 @@ app.patch("/parcels/:id/status", async (req, res) => {
     };
 
     // If a rider is rejecting the parcel, mark it as driver_rejected, clear assignment, and blacklist the rider
-    if (deliveryStatus === "driver_rejected" && riderEmail) {
+    if (deliveryStatus === "driver-rejected" && riderEmail) {
       updateDoc = {
         $set: {
-          deliveryStatus: "driver_rejected",
+          deliveryStatus: "driver-rejected",
           riderId: null,
           riderName: null,
           riderEmail: null,
@@ -383,6 +406,9 @@ app.patch("/parcels/:id/status", async (req, res) => {
         { $set: { workStatus: "available" } },
       );
     }
+
+    // 🌟 3. INSERT LOG TRACKING HERE
+    await logTracking(trackingId, deliveryStatus);
 
     res.send(result);
   } catch (error) {
@@ -428,6 +454,7 @@ app.post("/payment-checkout-session", async (req, res) => {
       metadata: {
         parcelId: paymentInfo.parcelId,
         parcelName: paymentInfo.parcelName,
+        trackingId: paymentInfo.trackingId,
       },
       success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
@@ -440,41 +467,42 @@ app.post("/payment-checkout-session", async (req, res) => {
   }
 });
 
-// old
-app.post("/create-checkout-session", async (req, res) => {
-  try {
-    const paymentInfo = req.body;
-    const amount = parseInt(paymentInfo.cost) * 100;
+// // old
+// app.post("/create-checkout-session", async (req, res) => {
+//   try {
+//     const paymentInfo = req.body;
+//     const amount = parseInt(paymentInfo.cost) * 100;
 
-    const session = await stripe.checkout.sessions.create({
-      line_items: [
-        {
-          price_data: {
-            currency: "USD",
-            unit_amount: amount,
-            product_data: {
-              name: paymentInfo.parcelName,
-            },
-          },
-          quantity: 1,
-        },
-      ],
-      customer_email: paymentInfo.senderEmail,
-      mode: "payment",
-      metadata: {
-        parcelId: paymentInfo.parcelId,
-      },
-      success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success`,
-      cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
-    });
-    console.log(session);
-    res.send({ url: session.url });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: error.message });
-  }
-});
+//     const session = await stripe.checkout.sessions.create({
+//       line_items: [
+//         {
+//           price_data: {
+//             currency: "USD",
+//             unit_amount: amount,
+//             product_data: {
+//               name: paymentInfo.parcelName,
+//             },
+//           },
+//           quantity: 1,
+//         },
+//       ],
+//       customer_email: paymentInfo.senderEmail,
+//       mode: "payment",
+//       metadata: {
+//         parcelId: paymentInfo.parcelId,
+//       },
+//       success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success`,
+//       cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
+//     });
+//     console.log(session);
+//     res.send({ url: session.url });
+//   } catch (error) {
+//     console.error(error);
+//     res.status(500).send({ message: error.message });
+//   }
+// });
 
+// logTracking
 app.patch("/payment-success", async (req, res) => {
   try {
     const sessionId = req.query.session_id;
@@ -494,7 +522,10 @@ app.patch("/payment-success", async (req, res) => {
       let trackingId;
 
       if (!existingPayment) {
-        trackingId = generateTrackingId();
+        // don't create new trackingId,use existing trackingId paymentInfo's metadata tracking id
+
+        // trackingId = generateTrackingId();
+        trackingId = session.metadata.trackingId;
 
         // 1. Update parcel status and payment info only if not already processed
         const update = {
@@ -523,6 +554,9 @@ app.patch("/payment-success", async (req, res) => {
         };
 
         resultPayment = await paymentCollections.insertOne(paymentRecord);
+
+        // 🌟 3. INSERT LOG TRACKING HERE
+        await logTracking(trackingId, "ready-for-pickup");
       } else {
         // If it already exists, fetch the existing trackingId from the parcel if needed
         const parcel = await parcelCollections.findOne(query);
@@ -751,6 +785,19 @@ app.delete(
     }
   },
 );
+
+//  Trackings related apis
+app.get("/trackings/:trackingId/logs", async (req, res) => {
+  try {
+    const trackingId = req.params.trackingId;
+    const query = { trackingId };
+    const result = await trackingCollections.find(query).toArray();
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: error.message });
+  }
+});
 
 app.listen(port, () => {
   console.log(`ZapShift app listening on port ${port}`);
