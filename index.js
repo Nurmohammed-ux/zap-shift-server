@@ -9,14 +9,12 @@ const stripe = require("stripe")(process.env.STRIPE_SECRET);
 const crypto = require("crypto");
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
-const { count } = require("console");
 
 try {
   const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
     "utf8",
   );
   const serviceAccount = JSON.parse(decoded);
-  // const serviceAccount = require("./zap-shift-firebase-adminsdk.json");
 
   initializeApp({
     credential: cert(serviceAccount),
@@ -38,9 +36,38 @@ function generateTrackingId() {
 app.use(cors());
 app.use(express.json());
 
+// mongodb
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.jd5uu0i.mongodb.net/?appName=Cluster0`;
+const client = new MongoClient(uri, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
+});
+
+const database = client.db("zap_shift_db");
+const userCollections = database.collection("users");
+const parcelCollections = database.collection("parcels");
+const paymentCollections = database.collection("payments");
+const riderCollections = database.collection("riders");
+const trackingCollections = database.collection("trackings");
+
+let cachedClient = null;
+
+async function connectToDatabase() {
+  if (cachedClient) {
+    return cachedClient;
+  }
+  await client.connect();
+  cachedClient = client;
+  return cachedClient;
+}
+
 //Jwt middleware
 const verifyFirebaseToken = async (req, res, next) => {
   try {
+    await connectToDatabase();
     const authorization = req.headers.authorization;
 
     if (!authorization || !authorization.startsWith("Bearer ")) {
@@ -63,33 +90,6 @@ const verifyFirebaseToken = async (req, res, next) => {
   }
 };
 
-// mongodb
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.jd5uu0i.mongodb.net/?appName=Cluster0`;
-// Create a MongoClient with a MongoClientOptions object to set the Stable API version
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
-
-const database = client.db("zap_shift_db");
-const userCollections = database.collection("users");
-const parcelCollections = database.collection("parcels");
-const paymentCollections = database.collection("payments");
-const riderCollections = database.collection("riders");
-const trackingCollections = database.collection("trackings");
-
-client
-  .connect()
-  .then(() => {
-    console.log("ZapShift server side connected to MongoDB");
-  })
-  .catch((err) => {
-    console.error("MongoDB connection failed:", err);
-  });
-
 app.get("/", (req, res) => {
   res.send("ZapShift server is running");
 });
@@ -101,9 +101,9 @@ app.get("/health", (req, res) => {
   });
 });
 
-//middleware with data access for admin and verify that
-//  must be used after verifyFirebaseToken
+// Admin middleware - must be used after verifyFirebaseToken
 const verifyAdmin = async (req, res, next) => {
+  await connectToDatabase();
   const email = req.token_email;
   const query = { email };
   const user = await userCollections.findOne(query);
@@ -115,8 +115,9 @@ const verifyAdmin = async (req, res, next) => {
   next();
 };
 
-//  must be used after verifyFirebaseToken
+// Rider middleware - must be used after verifyFirebaseToken
 const verifyRider = async (req, res, next) => {
+  await connectToDatabase();
   const email = req.token_email;
   const query = { email };
   const user = await userCollections.findOne(query);
@@ -129,6 +130,7 @@ const verifyRider = async (req, res, next) => {
 };
 
 const logTracking = async (trackingId, status) => {
+  await connectToDatabase();
   const log = {
     trackingId,
     status,
@@ -142,6 +144,7 @@ const logTracking = async (trackingId, status) => {
 // users related api
 app.post("/users", async (req, res) => {
   try {
+    await connectToDatabase();
     const user = req.body;
     user.role = "user";
     user.createdAt = new Date();
@@ -161,6 +164,7 @@ app.post("/users", async (req, res) => {
 
 app.get("/users", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
+    await connectToDatabase();
     const searchText = req.query.searchText;
 
     if (searchText && typeof searchText !== "string") {
@@ -205,10 +209,9 @@ app.get("/users", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   }
 });
 
-app.get("/users/:id", async (req, res) => {});
-
 app.get("/users/:email/role", async (req, res) => {
   try {
+    await connectToDatabase();
     const email = req.params.email;
     const query = { email };
     const user = await userCollections.findOne(query);
@@ -225,6 +228,7 @@ app.patch(
   verifyAdmin,
   async (req, res) => {
     try {
+      await connectToDatabase();
       const id = req.params.id;
       const roleInfo = req.body;
       const query = { _id: new ObjectId(id) };
@@ -247,9 +251,9 @@ app.patch(
 );
 
 // Parcels Api
-// for my-parcels and assigned rider
 app.get("/parcels", async (req, res) => {
   try {
+    await connectToDatabase();
     const query = {};
     const { email, deliveryStatus } = req.query;
 
@@ -278,13 +282,13 @@ app.get("/parcels", async (req, res) => {
   }
 });
 
-// get for assigned deliveries and completed deliveries
 app.get(
   "/parcels/rider",
   verifyFirebaseToken,
   verifyRider,
   async (req, res) => {
     try {
+      await connectToDatabase();
       const { riderEmail, deliveryStatus } = req.query;
 
       if (!riderEmail) {
@@ -292,7 +296,7 @@ app.get(
       }
 
       const query = {
-        riderEmail: riderEmail, // Only match parcels explicitly assigned to this rider
+        riderEmail: riderEmail,
       };
 
       if (deliveryStatus) {
@@ -319,6 +323,7 @@ app.get(
 
 app.get("/parcels/:id", async (req, res) => {
   try {
+    await connectToDatabase();
     const id = req.params.id;
     const query = { _id: new ObjectId(id) };
 
@@ -330,9 +335,9 @@ app.get("/parcels/:id", async (req, res) => {
   }
 });
 
-// using aggregation methods
 app.get("/parcels/delivery-status/stats", async (req, res) => {
   try {
+    await connectToDatabase();
     const pipeLine = [
       {
         $group: {
@@ -344,7 +349,6 @@ app.get("/parcels/delivery-status/stats", async (req, res) => {
         $project: {
           status: "$_id",
           count: 1,
-          // _id: 0,
         },
       },
     ];
@@ -356,16 +360,15 @@ app.get("/parcels/delivery-status/stats", async (req, res) => {
   }
 });
 
-// from pricing, logTracking, created trackingId
 app.post("/parcels", async (req, res) => {
   try {
+    await connectToDatabase();
     const parcel = req.body;
     const trackingId = generateTrackingId();
 
     parcel.createdAt = new Date();
     parcel.trackingId = trackingId;
 
-    // 🌟 3. INSERT LOG TRACKING HERE
     await logTracking(trackingId, "parcel-create");
 
     const result = await parcelCollections.insertOne(parcel);
@@ -376,13 +379,13 @@ app.post("/parcels", async (req, res) => {
   }
 });
 
-// TODO: rename this to be specific like /parcels/:id/assign from assignedRider, logTracking
 app.patch(
   "/parcels/:id",
   verifyFirebaseToken,
   verifyAdmin,
   async (req, res) => {
     try {
+      await connectToDatabase();
       const { riderId, riderName, riderContact, riderEmail, trackingId } =
         req.body;
       const id = req.params.id;
@@ -400,7 +403,6 @@ app.patch(
 
       const result = await parcelCollections.updateOne(query, updateDoc);
 
-      // update rider work status
       const riderQuery = { _id: new ObjectId(riderId) };
       const updatedRiderDoc = {
         $set: {
@@ -408,12 +410,8 @@ app.patch(
         },
       };
 
-      const riderResult = await riderCollections.updateOne(
-        riderQuery,
-        updatedRiderDoc,
-      );
+      await riderCollections.updateOne(riderQuery, updatedRiderDoc);
 
-      // 🌟 3. INSERT LOG TRACKING HERE
       await logTracking(trackingId, "driver-assigned");
 
       res.send(result);
@@ -424,13 +422,13 @@ app.patch(
   },
 );
 
-// from assignedDeliveries, logTracking
 app.patch(
   "/parcels/:id/status",
   verifyFirebaseToken,
   verifyRider,
   async (req, res) => {
     try {
+      await connectToDatabase();
       const { deliveryStatus, riderEmail, trackingId } = req.body;
       const id = req.params.id;
       const query = { _id: new ObjectId(id) };
@@ -441,7 +439,6 @@ app.patch(
         },
       };
 
-      // If a rider is rejecting the parcel, mark it as driver_rejected, clear assignment, and blacklist the rider
       if (deliveryStatus === "driver-rejected" && riderEmail) {
         updateDoc = {
           $set: {
@@ -457,7 +454,6 @@ app.patch(
 
       const result = await parcelCollections.updateOne(query, updateDoc);
 
-      // If the parcel is successfully marked as delivered, update the rider's workStatus to available
       if (deliveryStatus === "parcel-delivered" && riderEmail) {
         await riderCollections.updateOne(
           { email: riderEmail },
@@ -465,7 +461,6 @@ app.patch(
         );
       }
 
-      // 🌟 3. INSERT LOG TRACKING HERE
       await logTracking(trackingId, deliveryStatus);
 
       res.send(result);
@@ -478,6 +473,7 @@ app.patch(
 
 app.delete("/parcels/:id", verifyFirebaseToken, async (req, res) => {
   try {
+    await connectToDatabase();
     const id = req.params.id;
     const query = { _id: new ObjectId(id) };
 
@@ -489,7 +485,7 @@ app.delete("/parcels/:id", verifyFirebaseToken, async (req, res) => {
   }
 });
 
-// Payment and session related Api
+// Payment API
 app.post("/payment-checkout-session", async (req, res) => {
   try {
     const parcelInfo = req.body;
@@ -518,7 +514,6 @@ app.post("/payment-checkout-session", async (req, res) => {
       success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
     });
-    // console.log(session);
     res.send({ url: session.url });
   } catch (error) {
     console.error(error);
@@ -526,44 +521,9 @@ app.post("/payment-checkout-session", async (req, res) => {
   }
 });
 
-// // old
-// app.post("/create-checkout-session", async (req, res) => {
-//   try {
-//     const paymentInfo = req.body;
-//     const amount = parseInt(paymentInfo.cost) * 100;
-
-//     const session = await stripe.checkout.sessions.create({
-//       line_items: [
-//         {
-//           price_data: {
-//             currency: "USD",
-//             unit_amount: amount,
-//             product_data: {
-//               name: paymentInfo.parcelName,
-//             },
-//           },
-//           quantity: 1,
-//         },
-//       ],
-//       customer_email: paymentInfo.senderEmail,
-//       mode: "payment",
-//       metadata: {
-//         parcelId: paymentInfo.parcelId,
-//       },
-//       success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success`,
-//       cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
-//     });
-//     console.log(session);
-//     res.send({ url: session.url });
-//   } catch (error) {
-//     console.error(error);
-//     res.status(500).send({ message: error.message });
-//   }
-// });
-
-// logTracking
 app.patch("/payment-success", async (req, res) => {
   try {
+    await connectToDatabase();
     const sessionId = req.query.session_id;
     const session = await stripe.checkout.sessions.retrieve(sessionId);
 
@@ -571,7 +531,6 @@ app.patch("/payment-success", async (req, res) => {
       const id = session.metadata.parcelId;
       const query = { _id: new ObjectId(id) };
 
-      // Check if this payment record already exists to prevent duplicates
       const existingPayment = await paymentCollections.findOne({
         sessionId: session.id,
       });
@@ -581,12 +540,8 @@ app.patch("/payment-success", async (req, res) => {
       let trackingId;
 
       if (!existingPayment) {
-        // don't create new trackingId,use existing trackingId paymentInfo's metadata tracking id
-
-        // trackingId = generateTrackingId();
         trackingId = session.metadata.trackingId;
 
-        // 1. Update parcel status and payment info only if not already processed
         const update = {
           $set: {
             paymentStatus: "paid",
@@ -599,7 +554,6 @@ app.patch("/payment-success", async (req, res) => {
 
         result = await parcelCollections.updateOne(query, update);
 
-        // 2. Insert payment record once
         const paymentRecord = {
           parcelId: session.metadata.parcelId,
           transactionId: session.payment_intent,
@@ -614,10 +568,8 @@ app.patch("/payment-success", async (req, res) => {
 
         resultPayment = await paymentCollections.insertOne(paymentRecord);
 
-        // 🌟 3. INSERT LOG TRACKING HERE
         await logTracking(trackingId, "ready-for-pickup");
       } else {
-        // If it already exists, fetch the existing trackingId from the parcel if needed
         const parcel = await parcelCollections.findOne(query);
         trackingId = parcel?.trackingId;
       }
@@ -643,11 +595,8 @@ app.patch("/payment-success", async (req, res) => {
 
 app.get("/payments", verifyFirebaseToken, async (req, res) => {
   try {
+    await connectToDatabase();
     const email = req.token_email;
-
-    if (email !== req.token_email) {
-      return res.status(403).send({ message: "Forbidden access" });
-    }
 
     const result = await paymentCollections
       .aggregate([
@@ -687,9 +636,9 @@ app.get("/payments", verifyFirebaseToken, async (req, res) => {
 });
 
 // Riders related apis
-
 app.get("/riders", async (req, res) => {
   try {
+    await connectToDatabase();
     const { status, district, workStatus } = req.query;
     const query = {};
 
@@ -713,6 +662,7 @@ app.get("/riders", async (req, res) => {
 
 app.get("/riders/delivery-per-day", async (req, res) => {
   try {
+    await connectToDatabase();
     const email = req.query.email;
     const pipeLine = [
       {
@@ -758,6 +708,7 @@ app.get("/riders/delivery-per-day", async (req, res) => {
 
 app.post("/riders", async (req, res) => {
   try {
+    await connectToDatabase();
     const rider = req.body;
 
     const existingRider = await riderCollections.findOne({
@@ -771,7 +722,6 @@ app.post("/riders", async (req, res) => {
       });
     }
 
-    // 2. If not, proceed with insertion
     rider.status = "pending";
     rider.createdAt = new Date();
 
@@ -782,45 +732,9 @@ app.post("/riders", async (req, res) => {
   }
 });
 
-// app.patch("/riders/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
-//   try {
-//     const id = req.params.id;
-//     const status = req.body.status;
-//     const email = req.body.email;
-
-//     if (email !== req.token_email) {
-//       return res.status(403).send({ message: "Forbidden access" });
-//     }
-
-//     const query = { _id: new ObjectId(id) };
-//     const updateDoc = {
-//       $set: {
-//         status: status,
-//         workStatus: "available",
-//       },
-//     };
-//     const result = await riderCollections.updateOne(query, updateDoc);
-
-//     if (status === "approved") {
-//       const userQuery = { email };
-//       const updateUser = {
-//         $set: {
-//           role: "rider",
-//         },
-//       };
-//       const updateResult = await userCollections.updateOne(
-//         userQuery,
-//         updateUser,
-//       );
-//     }
-//     res.send(result);
-//   } catch (error) {
-//     res.status(500).send({ message: error.message });
-//   }
-// });
-
 app.patch("/riders/:id", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   try {
+    await connectToDatabase();
     const id = req.params.id;
     const { status } = req.body;
 
@@ -873,6 +787,7 @@ app.delete(
   verifyAdmin,
   async (req, res) => {
     try {
+      await connectToDatabase();
       const id = req.params.id;
       const email = req.query.email;
 
@@ -890,9 +805,10 @@ app.delete(
   },
 );
 
-//  Trackings related apis
+// Tracking related APIs
 app.get("/trackings/:trackingId/logs", async (req, res) => {
   try {
+    await connectToDatabase();
     const trackingId = req.params.trackingId;
     const query = { trackingId };
     const result = await trackingCollections.find(query).toArray();
