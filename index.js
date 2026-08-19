@@ -9,9 +9,14 @@ const stripe = require("stripe")(process.env.STRIPE_SECRET);
 const crypto = require("crypto");
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getAuth } = require("firebase-admin/auth");
+const { count } = require("console");
 
 try {
-  const serviceAccount = require("./zap-shift-firebase-adminsdk.json");
+  const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+    "utf8",
+  );
+  const serviceAccount = JSON.parse(decoded);
+  // const serviceAccount = require("./zap-shift-firebase-adminsdk.json");
 
   initializeApp({
     credential: cert(serviceAccount),
@@ -110,6 +115,19 @@ const verifyAdmin = async (req, res, next) => {
   next();
 };
 
+//  must be used after verifyFirebaseToken
+const verifyRider = async (req, res, next) => {
+  const email = req.token_email;
+  const query = { email };
+  const user = await userCollections.findOne(query);
+
+  if (!user || user.role !== "rider") {
+    return res.status(403).send({ message: "Forbidden Access" });
+  }
+
+  next();
+};
+
 const logTracking = async (trackingId, status) => {
   const log = {
     trackingId,
@@ -187,7 +205,7 @@ app.get("/users", verifyFirebaseToken, verifyAdmin, async (req, res) => {
   }
 });
 
-app.get("users/:id", async (req, res) => {});
+app.get("/users/:id", async (req, res) => {});
 
 app.get("/users/:email/role", async (req, res) => {
   try {
@@ -261,38 +279,43 @@ app.get("/parcels", async (req, res) => {
 });
 
 // get for assigned deliveries and completed deliveries
-app.get("/parcels/rider", async (req, res) => {
-  try {
-    const { riderEmail, deliveryStatus } = req.query;
+app.get(
+  "/parcels/rider",
+  verifyFirebaseToken,
+  verifyRider,
+  async (req, res) => {
+    try {
+      const { riderEmail, deliveryStatus } = req.query;
 
-    if (!riderEmail) {
-      return res.status(400).send({ message: "riderEmail is required" });
-    }
+      if (!riderEmail) {
+        return res.status(400).send({ message: "riderEmail is required" });
+      }
 
-    const query = {
-      riderEmail: riderEmail, // Only match parcels explicitly assigned to this rider
-    };
-
-    if (deliveryStatus) {
-      const statuses = deliveryStatus.split(",");
-      query.deliveryStatus = {
-        $in: statuses,
+      const query = {
+        riderEmail: riderEmail, // Only match parcels explicitly assigned to this rider
       };
+
+      if (deliveryStatus) {
+        const statuses = deliveryStatus.split(",");
+        query.deliveryStatus = {
+          $in: statuses,
+        };
+      }
+
+      const result = await parcelCollections
+        .find(query)
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      res.send(result);
+    } catch (error) {
+      console.error(error);
+      res.status(500).send({
+        message: error.message,
+      });
     }
-
-    const result = await parcelCollections
-      .find(query)
-      .sort({ createdAt: -1 })
-      .toArray();
-
-    res.send(result);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({
-      message: error.message,
-    });
-  }
-});
+  },
+);
 
 app.get("/parcels/:id", async (req, res) => {
   try {
@@ -300,6 +323,32 @@ app.get("/parcels/:id", async (req, res) => {
     const query = { _id: new ObjectId(id) };
 
     const result = await parcelCollections.findOne(query);
+    res.send(result);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: error.message });
+  }
+});
+
+// using aggregation methods
+app.get("/parcels/delivery-status/stats", async (req, res) => {
+  try {
+    const pipeLine = [
+      {
+        $group: {
+          _id: "$deliveryStatus",
+          count: { $sum: 1 },
+        },
+      },
+      {
+        $project: {
+          status: "$_id",
+          count: 1,
+          // _id: 0,
+        },
+      },
+    ];
+    const result = await parcelCollections.aggregate(pipeLine).toArray();
     res.send(result);
   } catch (error) {
     console.error(error);
@@ -328,96 +377,106 @@ app.post("/parcels", async (req, res) => {
 });
 
 // TODO: rename this to be specific like /parcels/:id/assign from assignedRider, logTracking
-app.patch("/parcels/:id", async (req, res) => {
-  try {
-    const { riderId, riderName, riderContact, riderEmail, trackingId } =
-      req.body;
-    const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
+app.patch(
+  "/parcels/:id",
+  verifyFirebaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { riderId, riderName, riderContact, riderEmail, trackingId } =
+        req.body;
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
 
-    const updateDoc = {
-      $set: {
-        deliveryStatus: "driver-assigned",
-        riderId: riderId,
-        riderName: riderName,
-        riderEmail: riderEmail,
-        riderContact: riderContact,
-      },
-    };
+      const updateDoc = {
+        $set: {
+          deliveryStatus: "driver-assigned",
+          riderId: riderId,
+          riderName: riderName,
+          riderEmail: riderEmail,
+          riderContact: riderContact,
+        },
+      };
 
-    const result = await parcelCollections.updateOne(query, updateDoc);
+      const result = await parcelCollections.updateOne(query, updateDoc);
 
-    // update rider work status
-    const riderQuery = { _id: new ObjectId(riderId) };
-    const updatedRiderDoc = {
-      $set: {
-        workStatus: "in-transit",
-      },
-    };
+      // update rider work status
+      const riderQuery = { _id: new ObjectId(riderId) };
+      const updatedRiderDoc = {
+        $set: {
+          workStatus: "in-transit",
+        },
+      };
 
-    const riderResult = await riderCollections.updateOne(
-      riderQuery,
-      updatedRiderDoc,
-    );
+      const riderResult = await riderCollections.updateOne(
+        riderQuery,
+        updatedRiderDoc,
+      );
 
-    // 🌟 3. INSERT LOG TRACKING HERE
-    await logTracking(trackingId, "driver-assigned");
+      // 🌟 3. INSERT LOG TRACKING HERE
+      await logTracking(trackingId, "driver-assigned");
 
-    res.send(result);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: error.message });
-  }
-});
+      res.send(result);
+    } catch (error) {
+      console.error(error);
+      res.status(500).send({ message: error.message });
+    }
+  },
+);
 
 // from assignedDeliveries, logTracking
-app.patch("/parcels/:id/status", async (req, res) => {
-  try {
-    const { deliveryStatus, riderEmail, trackingId } = req.body;
-    const id = req.params.id;
-    const query = { _id: new ObjectId(id) };
+app.patch(
+  "/parcels/:id/status",
+  verifyFirebaseToken,
+  verifyRider,
+  async (req, res) => {
+    try {
+      const { deliveryStatus, riderEmail, trackingId } = req.body;
+      const id = req.params.id;
+      const query = { _id: new ObjectId(id) };
 
-    let updateDoc = {
-      $set: {
-        deliveryStatus: deliveryStatus,
-      },
-    };
-
-    // If a rider is rejecting the parcel, mark it as driver_rejected, clear assignment, and blacklist the rider
-    if (deliveryStatus === "driver-rejected" && riderEmail) {
-      updateDoc = {
+      let updateDoc = {
         $set: {
-          deliveryStatus: "driver-rejected",
-          riderId: null,
-          riderName: null,
-          riderEmail: null,
-          riderContact: null,
+          deliveryStatus: deliveryStatus,
         },
-        $push: { rejectedRiders: riderEmail },
       };
+
+      // If a rider is rejecting the parcel, mark it as driver_rejected, clear assignment, and blacklist the rider
+      if (deliveryStatus === "driver-rejected" && riderEmail) {
+        updateDoc = {
+          $set: {
+            deliveryStatus: "driver-rejected",
+            riderId: null,
+            riderName: null,
+            riderEmail: null,
+            riderContact: null,
+          },
+          $push: { rejectedRiders: riderEmail },
+        };
+      }
+
+      const result = await parcelCollections.updateOne(query, updateDoc);
+
+      // If the parcel is successfully marked as delivered, update the rider's workStatus to available
+      if (deliveryStatus === "parcel-delivered" && riderEmail) {
+        await riderCollections.updateOne(
+          { email: riderEmail },
+          { $set: { workStatus: "available" } },
+        );
+      }
+
+      // 🌟 3. INSERT LOG TRACKING HERE
+      await logTracking(trackingId, deliveryStatus);
+
+      res.send(result);
+    } catch (error) {
+      console.error(error);
+      res.status(500).send({ message: error.message });
     }
+  },
+);
 
-    const result = await parcelCollections.updateOne(query, updateDoc);
-
-    // If the parcel is successfully marked as delivered, update the rider's workStatus to available
-    if (deliveryStatus === "parcel-delivered" && riderEmail) {
-      await riderCollections.updateOne(
-        { email: riderEmail },
-        { $set: { workStatus: "available" } },
-      );
-    }
-
-    // 🌟 3. INSERT LOG TRACKING HERE
-    await logTracking(trackingId, deliveryStatus);
-
-    res.send(result);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: error.message });
-  }
-});
-
-app.delete("/parcels/:id", async (req, res) => {
+app.delete("/parcels/:id", verifyFirebaseToken, async (req, res) => {
   try {
     const id = req.params.id;
     const query = { _id: new ObjectId(id) };
@@ -433,8 +492,8 @@ app.delete("/parcels/:id", async (req, res) => {
 // Payment and session related Api
 app.post("/payment-checkout-session", async (req, res) => {
   try {
-    const paymentInfo = req.body;
-    const amount = parseInt(paymentInfo.cost) * 100;
+    const parcelInfo = req.body;
+    const amount = parseInt(parcelInfo.cost) * 100;
 
     const session = await stripe.checkout.sessions.create({
       line_items: [
@@ -443,18 +502,18 @@ app.post("/payment-checkout-session", async (req, res) => {
             currency: "USD",
             unit_amount: amount,
             product_data: {
-              name: paymentInfo.parcelName,
+              name: `Please pay for ${parcelInfo.parcelName}`,
             },
           },
           quantity: 1,
         },
       ],
-      customer_email: paymentInfo.senderEmail,
+      customer_email: parcelInfo.senderEmail,
       mode: "payment",
       metadata: {
-        parcelId: paymentInfo.parcelId,
-        parcelName: paymentInfo.parcelName,
-        trackingId: paymentInfo.trackingId,
+        parcelId: parcelInfo.parcelId,
+        parcelName: parcelInfo.parcelName,
+        trackingId: parcelInfo.trackingId,
       },
       success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
       cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
@@ -518,7 +577,7 @@ app.patch("/payment-success", async (req, res) => {
       });
 
       let resultPayment = existingPayment;
-      let result = null; // Declare result beforehand
+      let result = null;
       let trackingId;
 
       if (!existingPayment) {
@@ -575,7 +634,7 @@ app.patch("/payment-success", async (req, res) => {
       });
     }
 
-    res.send({ success: false, message: "Payment not completed" });
+    return res.send({ success: false, message: "Payment not completed" });
   } catch (error) {
     console.error("Payment success route error:", error);
     res.status(500).send({ message: error.message });
@@ -646,6 +705,51 @@ app.get("/riders", async (req, res) => {
 
     const cursor = riderCollections.find(query);
     const result = await cursor.toArray();
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({ message: error.message });
+  }
+});
+
+app.get("/riders/delivery-per-day", async (req, res) => {
+  try {
+    const email = req.query.email;
+    const pipeLine = [
+      {
+        $match: {
+          riderEmail: email,
+          deliveryStatus: "parcel-delivered",
+        },
+      },
+      {
+        $lookup: {
+          from: "trackings",
+          localField: "trackingId",
+          foreignField: "trackingId",
+          as: "parcelTrackings",
+        },
+      },
+      {
+        $unwind: "$parcelTrackings",
+      },
+      {
+        $match: {
+          "parcelTrackings.status": "parcel-delivered",
+        },
+      },
+      {
+        $group: {
+          _id: {
+            $dateToString: {
+              format: "%Y-%m-%d",
+              date: "$parcelTrackings.createdAt",
+            },
+          },
+          count: { $sum: 1 },
+        },
+      },
+    ];
+    const result = await parcelCollections.aggregate(pipeLine).toArray();
     res.send(result);
   } catch (error) {
     res.status(500).send({ message: error.message });
@@ -799,6 +903,10 @@ app.get("/trackings/:trackingId/logs", async (req, res) => {
   }
 });
 
-app.listen(port, () => {
-  console.log(`ZapShift app listening on port ${port}`);
-});
+if (process.env.NODE_ENV !== "production") {
+  app.listen(port, () => {
+    console.log(`Server running on port ${port}`);
+  });
+}
+
+module.exports = app;
